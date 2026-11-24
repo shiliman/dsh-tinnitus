@@ -1,0 +1,45 @@
+{
+  "name": "dsh-tinnitus",
+  "version": "0.1.0",
+  "description": "给 DeepSeek Harness 的一条「耳鸣」副线：耳朵里那声高频一直没停，安静时更响，听不清时会把话听岔、要人再说一遍。默认非全局、按会话开关、可随时关掉。",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": {
+      "import": "./src/index.js"
+    },
+    "./package.json": "./package.json",
+    "./client": "./client.js"
+  },
+  "files": [
+    "src",
+    "client.js",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/index.js && node --check src/panel.js && node --check client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "tinnitus"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0",
+    "dsh": ">=0.2.0-rc.2"
+  }
+}
