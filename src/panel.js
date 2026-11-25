@@ -207,6 +207,18 @@ export function attachPanel(ctx, api) {
           lastFlareAt: num(st.lastFlareAt),
           updatedAt: num(st.updatedAt),
         },
+        // 病程：进行中的那一条 + 最近几条已结束的
+        episode: st.episode
+          ? {
+              startedAt: num(st.episode.startedAt),
+              minutes: Math.max(0, Math.round((now - num(st.episode.startedAt)) / 60_000)),
+              peak: Math.round(num(st.episode.peak)),
+              flares: Math.round(num(st.episode.flares)),
+              reliefs: Math.round(num(st.episode.reliefs)),
+              leaves: Math.round(num(st.episode.leaves)),
+            }
+          : null,
+        episodes: Array.isArray(st.episodes) ? st.episodes.slice(-5) : [],
       },
       history: readHistoryAll()[sid] || [],
     }
@@ -224,12 +236,14 @@ export function attachPanel(ctx, api) {
     const rt = api.loadRt(sid)
     if (action === 'on') {
       rt.enabled = true
+      if (!rt.state?.episode && typeof api.beginEpisode === 'function') rt.state = api.beginEpisode(rt.state, now)
       try {
         api.attach(rt)
       } catch {}
       api.saveRt(rt)
     } else if (action === 'off') {
       rt.enabled = false
+      if (typeof api.sealEpisode === 'function') rt.state = api.sealEpisode(rt.state, now, 'off')
       try {
         rt.detach?.()
       } catch {}

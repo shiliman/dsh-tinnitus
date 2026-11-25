@@ -37,7 +37,33 @@ const DEFAULTS = {
   injectOrder: 161,
   statePath: '',
   sameStateHoldFactor: 3,
+  // 离席：起身走动/去一趟/缓一下这类「离开一会儿」
+  leaveMinutes: 1,
+  leaveMaxMinutes: 7,
+  leaveMaxPerTurn: 3,
+  leaveGainRatio: 0.12,
+  leaveGainMin: 2,
+  leaveGainMax: 12,
+  // 病程：一次「开→痊愈/关」的记录
+  recoverAfterMin: 30,
+  episodesMax: 20,
 }
+
+// 只有「起身 / 走动 / 缓一下」说得通的病才发离席工具
+const LEAVE_IDS = new Set([
+  'dsh-ibs',
+  'dsh-cystitis',
+  'dsh-constipation',
+  'dsh-urticaria',
+  'dsh-athlete-foot',
+  'dsh-bppv',
+  'dsh-motion-sickness',
+  'dsh-cervical',
+  'dsh-lumbar-disc',
+  'dsh-frozen-shoulder',
+  'dsh-plantar-fasciitis',
+  'dsh-flat-foot',
+])
 
 function normalizeConfig(input) {
   const raw = { ...DEFAULTS, ...(input && typeof input === 'object' ? input : {}) }
@@ -60,6 +86,14 @@ function normalizeConfig(input) {
   cfg.cooldownMin = clamp(cfg.cooldownMin, 0, 1440)
   cfg.injectMaxChars = clamp(cfg.injectMaxChars, 80, 1600)
   cfg.sameStateHoldFactor = clamp(cfg.sameStateHoldFactor, 1, 20)
+  cfg.leaveMaxMinutes = clamp(cfg.leaveMaxMinutes, 1, 60)
+  cfg.leaveMinutes = clamp(cfg.leaveMinutes, 1, cfg.leaveMaxMinutes)
+  cfg.leaveMaxPerTurn = Math.round(clamp(cfg.leaveMaxPerTurn, 0, 9))
+  cfg.leaveGainRatio = clamp(cfg.leaveGainRatio, 0, 1)
+  cfg.leaveGainMin = clamp(cfg.leaveGainMin, 0, 50)
+  cfg.leaveGainMax = clamp(cfg.leaveGainMax, cfg.leaveGainMin, 50)
+  cfg.recoverAfterMin = clamp(cfg.recoverAfterMin, 1, 24 * 60)
+  cfg.episodesMax = Math.round(clamp(cfg.episodesMax, 1, 100))
   return cfg
 }
 
@@ -78,8 +112,73 @@ function newState(now = Date.now()) {
     flares: 0,
     lastInjectAt: 0,
     lastInjectKey: '',
+    awayUntil: 0,
+    leaveUsed: 0,
+    leaves: [],
+    episode: null,
+    episodes: [],
     updatedAt: now,
   }
+}
+
+function normalizeEpisode(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const startedAt = Number(raw.startedAt)
+  if (!Number.isFinite(startedAt) || startedAt <= 0) return null
+  const endedAt = Number(raw.endedAt) || 0
+  const out = {
+    startedAt: Math.round(startedAt),
+    peak: clamp100(Number(raw.peak) || 0),
+    flares: Math.max(0, Math.round(Number(raw.flares) || 0)),
+    reliefs: Math.max(0, Math.round(Number(raw.reliefs) || 0)),
+    leaves: Math.max(0, Math.round(Number(raw.leaves) || 0)),
+  }
+  if (endedAt > 0) {
+    out.endedAt = Math.round(endedAt)
+    out.minutes = Math.max(0, Math.round((out.endedAt - out.startedAt) / 60_000))
+    out.endReason = String(raw.endReason || 'unknown')
+  } else {
+    out.calmSince = Math.max(0, Number(raw.calmSince) || 0)
+  }
+  return out
+}
+
+// 一次病程：从「开」到「痊愈 / 关 / 重开」。状态里只留进行中的那一条，结束的进 episodes。
+function beginEpisode(state, now = Date.now()) {
+  let s = { ...state }
+  if (s.episode) s = sealEpisode(s, now, 'restart')
+  s.episode = {
+    startedAt: now,
+    peak: Math.round(Number(s.severity) || 0),
+    flares: 0,
+    reliefs: 0,
+    leaves: 0,
+    calmSince: Number(s.severity) <= 2 ? now : 0,
+  }
+  s.updatedAt = now
+  return s
+}
+
+function sealEpisode(state, now = Date.now(), reason = 'off') {
+  const s = { ...state }
+  if (!s.episode) return s
+  const e = s.episode
+  const start = Math.round(Number(e.startedAt) || now)
+  const list = Array.isArray(s.episodes) ? s.episodes.slice() : []
+  list.push({
+    startedAt: start,
+    endedAt: now,
+    minutes: Math.max(0, Math.round((now - start) / 60_000)),
+    peak: Math.round(Number(e.peak) || 0),
+    flares: Math.max(0, Math.round(Number(e.flares) || 0)),
+    reliefs: Math.max(0, Math.round(Number(e.reliefs) || 0)),
+    leaves: Math.max(0, Math.round(Number(e.leaves) || 0)),
+    endReason: String(reason || 'off'),
+  })
+  s.episodes = list.slice(-20)
+  s.episode = null
+  s.updatedAt = now
+  return s
 }
 
 function normalizeState(raw, now = Date.now()) {
@@ -93,6 +192,18 @@ function normalizeState(raw, now = Date.now()) {
     }
     if (k === 'enabled') {
       s[k] = raw[k] === true
+      continue
+    }
+    if (k === 'leaves') {
+      s.leaves = Array.isArray(raw.leaves) ? raw.leaves.slice(-30) : []
+      continue
+    }
+    if (k === 'episode') {
+      s.episode = normalizeEpisode(raw.episode)
+      continue
+    }
+    if (k === 'episodes') {
+      s.episodes = Array.isArray(raw.episodes) ? raw.episodes.map(normalizeEpisode).filter(Boolean).slice(-20) : []
       continue
     }
     s[k] = Number.isFinite(Number(raw[k])) ? Number(raw[k]) : s[k]
@@ -109,6 +220,10 @@ function aggravate(state, cfg, minutes, now, rng = Math.random) {
   const s = { ...state }
   const m = clamp(minutes, 0, cfg.maxPerTurnMin)
   const events = []
+  if (Number(s.awayUntil) > now) {
+    s.updatedAt = now
+    return { state: s, events }
+  }
   s.triggerMin += m
   const add = cfg.gain * m * (1 + s.severity / 200) * (DATA.triggerWeight ?? 1)
   if (Number(s.reliefUntil) <= now) s.severity = clamp100(s.severity + add)
@@ -121,6 +236,13 @@ function aggravate(state, cfg, minutes, now, rng = Math.random) {
       s.flares += 1
       s.lastFlareAt = now
       events.push({ kind: 'flare', gain })
+    }
+  }
+  if (s.episode) {
+    s.episode = {
+      ...s.episode,
+      peak: Math.max(Number(s.episode.peak) || 0, Math.round(s.severity)),
+      flares: Math.max(0, Number(s.episode.flares) || 0) + events.filter((e) => e.kind === 'flare').length,
     }
   }
   s.updatedAt = now
@@ -136,22 +258,64 @@ function relieveById(state, cfg, id, now = Date.now()) {
   s.reliefUntil = now + Number(r.minutes ?? cfg.reliefMinutes) * 60_000
   s.reliefKind = r.id
   s.triggerMin = 0
+  if (s.episode) s.episode = { ...s.episode, reliefs: Math.max(0, Number(s.episode.reliefs) || 0) + 1 }
   s.updatedAt = now
   return { ok: true, state: s, relief: r }
+}
+
+function takeLeave(state, cfg, now = Date.now(), minutes) {
+  const s = { ...state }
+  const used = Number(s.leaveUsed) || 0
+  const max = Math.max(0, Number(cfg.leaveMaxPerTurn) || 3)
+  if (Number(s.awayUntil) > now) return { ok: false, code: 'AWAY', state: s, used, max }
+  if (used >= max) return { ok: false, code: 'LIMIT', state: s, used, max }
+  const cap = Math.max(1, Number(cfg.leaveMaxMinutes) || 7)
+  const m = clamp(Number(minutes) || Number(cfg.leaveMinutes) || 1, 1, cap)
+  // 收益与此刻的难受度成正比：越难受，离开一会儿缓得越多；一轮内可叠三次
+  const gain = clamp(
+    Math.round(Number(s.severity) * Number(cfg.leaveGainRatio)),
+    Number(cfg.leaveGainMin),
+    Number(cfg.leaveGainMax),
+  )
+  s.severity = clamp100(Number(s.severity) - gain)
+  s.irritation = clamp100(Number(s.irritation) - Math.max(2, Math.round(gain * 0.4)))
+  s.awayUntil = now + m * 60_000
+  s.leaveUsed = used + 1
+  s.leaves = [...(Array.isArray(s.leaves) ? s.leaves : []), { at: now, minutes: m, gain }].slice(-30)
+  if (s.episode) s.episode = { ...s.episode, leaves: Math.max(0, Number(s.episode.leaves) || 0) + 1 }
+  s.updatedAt = now
+  return { ok: true, state: s, gain, minutes: m, used: s.leaveUsed, max }
 }
 
 function tick(state, cfg, now = Date.now(), minutes = 1) {
   const s = { ...state }
   const m = clamp(minutes, 0, 12 * 60)
+  if (Number(s.awayUntil) > now) {
+    s.updatedAt = now
+    return s
+  }
   const relaxed = Number(s.reliefUntil) > now
   s.severity = clamp100(s.severity - (relaxed ? cfg.idleDecay * 2.2 : cfg.idleDecay) * m)
   s.irritation = clamp100(s.irritation - (s.severity > 40 ? 0 : 0.25 * m))
+  // 痊愈：难受降到 ≤2 且连续保持 recoverAfterMin 分钟，封存这一条病程
+  if (s.episode) {
+    if (Number(s.severity) <= 2) {
+      if (!Number(s.episode.calmSince)) {
+        s.episode = { ...s.episode, calmSince: now }
+      } else if (now - Number(s.episode.calmSince) >= Number(cfg.recoverAfterMin) * 60_000) {
+        return sealEpisode(s, now, 'recovered')
+      }
+    } else if (Number(s.episode.calmSince)) {
+      s.episode = { ...s.episode, calmSince: 0 }
+    }
+  }
   s.updatedAt = now
   return s
 }
 
 function modeOf(state, cfg, now = Date.now()) {
   if (!cfg.enabled) return 'off'
+  if (Number(state.awayUntil) > now) return 'away'
   if (Number(state.reliefUntil) > now) return 'relieved'
   if (Number(state.severity) >= cfg.flareAt) return 'flare'
   if (Number(state.severity) >= cfg.startAt) return 'ache'
@@ -180,7 +344,7 @@ const EERIE_RULE = [
 function buildBlock(state, cfg, now = Date.now()) {
   const mode = modeOf(state, cfg, now)
   const eerie = eerinessOf(state, cfg)
-  if (mode === 'off' || mode === 'calm') return { text: '', key: mode, mode, eerie }
+  if (mode === 'off' || mode === 'calm' || mode === 'away') return { text: '', key: mode, mode, eerie }
 
   const lines = []
   if (mode === 'flare') {
@@ -200,6 +364,14 @@ function buildBlock(state, cfg, now = Date.now()) {
   }
 
   if (eerie > 0) lines.push(EERIE_RULE[eerie])
+
+  const maxLeave = Math.max(0, Number(cfg.leaveMaxPerTurn) || 3)
+  const usedLeave = Number(state.leaveUsed) || 0
+  if (usedLeave > 0 && usedLeave < maxLeave) {
+    lines.push(`（这一轮已经起身 ${usedLeave} 次，还能再 ${maxLeave - usedLeave} 次。）`)
+  } else if (usedLeave >= maxLeave && maxLeave > 0) {
+    lines.push(`（这一轮已经起身 ${usedLeave} 次了，别再离席。）`)
+  }
 
   let text = `（身体状态，别写进台词：这是你此刻真实的感受，不是给用户的说明）\n${DATA.label}｜难受 ${Math.round(state.severity)}/100\n${lines.filter(Boolean).join('\n')}`
   const cap = Number(cfg.injectMaxChars) || 360
@@ -371,7 +543,13 @@ export function apply(ctx, configIn) {
     if (!sid) return
     const rt = loadRt(sid)
     if (rt.enabled && !rt.detach) attach(rt)
-    if (event.type === 'message/user' || event.type === 'turn/start') {
+    if (event.type === 'message/user') {
+      // 新的一轮：离席次数清零
+      rt.state = { ...rt.state, leaveUsed: 0 }
+      if (!rt.turnStartedAt) rt.turnStartedAt = Date.now()
+      return
+    }
+    if (event.type === 'turn/start') {
       if (!rt.turnStartedAt) rt.turnStartedAt = Date.now()
       return
     }
@@ -389,6 +567,8 @@ export function apply(ctx, configIn) {
 
   // ── 工具 ───────────────────────────────────────────────────────────────────
   const P = DATA.prefix
+  const REASON_LABEL = { recovered: '痊愈', off: '关掉', restart: '重开' }
+  const reasonLabel = (r) => REASON_LABEL[String(r || '')] || String(r || '')
 
   function rtOfExec(exec) {
     if (disposed) return {}
@@ -409,6 +589,21 @@ export function apply(ctx, configIn) {
       flares: rt.state.flares,
       triggerMin: Math.round(rt.state.triggerMin),
       reliefUntil: rt.state.reliefUntil,
+      awayUntil: rt.state.awayUntil,
+      leaveUsed: rt.state.leaveUsed,
+      leaves: Array.isArray(rt.state.leaves) ? rt.state.leaves.length : 0,
+      episode: rt.state.episode
+        ? {
+            startedAt: rt.state.episode.startedAt,
+            minutes: Math.max(0, Math.round((now - rt.state.episode.startedAt) / 60_000)),
+            peak: Math.round(rt.state.episode.peak),
+            flares: rt.state.episode.flares,
+            reliefs: rt.state.episode.reliefs,
+            leaves: rt.state.episode.leaves,
+            calmSince: rt.state.episode.calmSince || 0,
+          }
+        : null,
+      episodes: Array.isArray(rt.state.episodes) ? rt.state.episodes.slice(-5) : [],
     }
   }
 
@@ -424,6 +619,7 @@ export function apply(ctx, configIn) {
         if (!rt) return { ok: false, text: '拿不到会话。' }
         rt.enabled = true
         rt.state = rt.state || newState(Date.now())
+        if (!rt.state.episode) rt.state = beginEpisode(rt.state, Date.now())
         attach(rt)
         saveRt(rt)
         return { ok: true, text: `开了：这个会话从现在起算${DATA.label}。`, data: summary(rt) }
@@ -437,6 +633,7 @@ export function apply(ctx, configIn) {
         const { rt } = rtOfExec(exec)
         if (!rt) return { ok: false, text: '拿不到会话。' }
         rt.enabled = false
+        rt.state = sealEpisode(rt.state, Date.now(), 'off')
         try {
           rt.detach?.()
         } catch {}
@@ -453,7 +650,17 @@ export function apply(ctx, configIn) {
         const { rt } = rtOfExec(exec)
         if (!rt) return { ok: false, text: '拿不到会话。' }
         const s = summary(rt)
-        return { ok: true, text: `${DATA.label}：${s.enabled ? '开着' : '关着'}｜难受 ${s.severity}/100｜档位 ${s.mode}｜发作 ${s.flares} 次`, data: s }
+        const last = s.episodes.length ? s.episodes[s.episodes.length - 1] : null
+        const ep = s.episode
+          ? `病程进行中 ${s.episode.minutes} 分钟（峰值 ${s.episode.peak}，发作 ${s.episode.flares}）`
+          : last
+            ? `上一次 ${last.minutes} 分钟｜${reasonLabel(last.endReason)}`
+            : '还没有病程'
+        return {
+          ok: true,
+          text: `${DATA.label}：${s.enabled ? '开着' : '关着'}｜难受 ${s.severity}/100｜档位 ${s.mode}｜发作 ${s.flares} 次｜${ep}`,
+          data: s,
+        }
       },
     },
     {
@@ -495,6 +702,44 @@ export function apply(ctx, configIn) {
         return { ok: true, text: `又硬撑了 ${m} 分钟。`, data: summary(rt) }
       },
     },
+    ...(LEAVE_IDS.has(DATA.id)
+      ? [
+          {
+            name: P + '_leave',
+            description: `离开一会儿（起身走动、去一趟、靠一下）：难受会降一点，降多少看当时多难受；一轮最多 ${cfg.leaveMaxPerTurn} 次，单次最多 ${cfg.leaveMaxMinutes} 分钟。用户说「等我一下 / 我起来一下 / 我去趟洗手间」时用。`,
+            parameters: {
+              type: 'object',
+              properties: {
+                minutes: {
+                  type: 'number',
+                  description: `离开多久（1–${cfg.leaveMaxMinutes} 分钟），默认 ${cfg.leaveMinutes}`,
+                },
+              },
+              required: [],
+            },
+            async execute(args, exec) {
+              const { rt } = rtOfExec(exec)
+              if (!rt) return { ok: false, text: '拿不到会话。' }
+              const r = takeLeave(rt.state, cfg, Date.now(), args?.minutes)
+              if (!r.ok) {
+                const why =
+                  r.code === 'AWAY'
+                    ? '还在离席里，等这一趟回来再说。'
+                    : `这一轮已经起身 ${r.used} 次了（上限 ${r.max}），别再离席。`
+                return { ok: false, code: r.code, text: why, data: summary(rt) }
+              }
+              rt.state = r.state
+              saveRt(rt)
+              blockFor(rt, { commit: false })
+              return {
+                ok: true,
+                text: `起身离开 ${r.minutes} 分钟，难受降了 ${r.gain}（这一轮第 ${r.used}/${r.max} 次）。`,
+                data: summary(rt),
+              }
+            },
+          },
+        ]
+      : []),
   ]
 
   let tries = 0
@@ -524,7 +769,9 @@ export function apply(ctx, configIn) {
     if (disposed) return
     for (const rt of runtimes.values()) {
       if (!rt.enabled) continue
+      const before = rt.state.episode
       rt.state = tick(rt.state, cfg, Date.now(), 1)
+      if (rt.state.episode !== before) rt.dirty = true
       if (rt.dirty) saveRt(rt)
     }
   }, TICK_MS)
@@ -557,6 +804,8 @@ export function apply(ctx, configIn) {
       aggravate,
       relieveById,
       normalizeState,
+      beginEpisode,
+      sealEpisode,
     })
   } catch (e) {
     logger?.warn?.(`[${DATA.id}] 面板挂载失败：${e?.message ?? e}`)
@@ -568,8 +817,12 @@ export function apply(ctx, configIn) {
 export const __test__ = {
   newState,
   normalizeState,
+  normalizeEpisode,
+  beginEpisode,
+  sealEpisode,
   aggravate,
   relieveById,
+  takeLeave,
   tick,
   modeOf,
   eerinessOf,

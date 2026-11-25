@@ -95,6 +95,18 @@ window.__ModuleLoader__.load({
         const d = new Date(t)
         return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
       }
+      const fmtDay = (ms) => {
+        const t = Number(ms)
+        if (!t) return '—'
+        const d = new Date(t)
+        return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+      }
+      const fmtDur = (m) => {
+        const n = Math.max(0, Math.round(Number(m) || 0))
+        if (n < 60) return n + ' 分钟'
+        return Math.floor(n / 60) + ' 小时 ' + (n % 60) + ' 分'
+      }
+      const EP_REASON = { recovered: '痊愈', off: '关掉', restart: '重开' }
       const fmtAgo = (ms) => {
         const t = Number(ms)
         if (!t) return '还没注入过'
@@ -368,6 +380,33 @@ window.__ModuleLoader__.load({
           ),
         )
 
+        const epRow = (e, live) =>
+          h(
+            'div',
+            { className: 'dp-cue', key: String(e.startedAt) + (live ? ':live' : '') },
+            h('div', { className: 'dp-cue-k' }, fmtDay(e.startedAt) + (live ? ' · 进行中' : '')),
+            h(
+              'div',
+              { className: 'dp-cue-v' },
+              fmtDur(e.minutes) +
+                ' · 峰值 ' + Number(e.peak || 0) +
+                (e.flares ? ' · 发作 ' + Number(e.flares) : '') +
+                (e.reliefs ? ' · 缓解 ' + Number(e.reliefs) : '') +
+                (e.leaves ? ' · 离席 ' + Number(e.leaves) : '') +
+                (live ? '' : ' · ' + (EP_REASON[e.endReason] || e.endReason || '—')),
+            ),
+          )
+
+        const episodesCard = h(
+          'div',
+          { className: 'dp-card' },
+          h('div', { className: 'dp-sec-title' }, '病程', h('span', { className: 'dp-hint' }, '从开到痊愈/关掉，一次一条（这里显示最近 5 条）')),
+          sess && sess.episode
+            ? epRow(sess.episode, true)
+            : h('div', { className: 'dp-hint' }, sess ? '这一轮还没有进行中的病程（开一次副线就会开始记）' : '还没有会话数据'),
+          (sess && Array.isArray(sess.episodes) ? sess.episodes : []).slice().reverse().map((e) => epRow(e, false)),
+        )
+
         const info = h(
           'div',
           { className: 'dp-grid2' },
@@ -415,7 +454,7 @@ window.__ModuleLoader__.load({
                   h('div', null, h('b', null, '还没有会话开过它。')),
                   h('div', null, '在会话里让它跑起来一次，这块面板就会有数据；下面的刻度与语言方式可以先看。'),
                 ),
-            h('div', { className: 'dp-stack' }, h('div', { className: 'dp-grid2' }, heroLeft, heroRight), graphCard, controls, info, foot),
+            h('div', { className: 'dp-stack' }, h('div', { className: 'dp-grid2' }, heroLeft, heroRight), graphCard, controls, episodesCard, info, foot),
           ),
         )
       }
